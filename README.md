@@ -49,6 +49,16 @@ Beispiel OpenCode (`opencode.json`):
 - Der Server schreibt JSON ausschließlich nach `stdout`, Logs nach `stderr` – so, wie es der MCP-stdio-Transport verlangt.
 - Unterstützte Protokollversionen: `2024-11-05`, `2025-03-26`, `2025-06-18`.
 
+## Tests
+
+Die Tests starten den Server als Prozess und sprechen das MCP-Protokoll mit ihm (E2E, `node:test` – ohne externe Abhängigkeiten). Sie prüfen u. a., dass eingelegte Fehler in deutschen und englischen Texten (Rechtschreibung, Grammatik, Großschreibung) erkannt werden und dass fehlerfreie Texte sauber durchgehen.
+
+Voraussetzung: Node.js ≥ 18 und eine erreichbare LanguageTool-Instanz (`LT_BASE_URL`, Standard `http://localhost:8081`). Ohne erreichbare Instanz werden die Tests übersprungen (skip), statt zu scheitern.
+
+```bash
+node --test
+```
+
 ## Lizenz
 
 [MIT](LICENSE)
