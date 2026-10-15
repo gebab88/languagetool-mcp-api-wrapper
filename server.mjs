@@ -7,7 +7,8 @@
  * als MacPorts-Daemon:  languagetool-server --http --port 8081
  *
  * Umgebung:
- *   LT_BASE_URL  Basis-URL der LT-Instanz (Standard: http://localhost:8081)
+ *   LT_BASE_URL          Basis-URL der LT-Instanz (Standard: http://localhost:8081)
+ *   LT_CHECK_TIMEOUT_MS  Timeout für /v2/check in ms (Standard: 60000)
  *
  * Der Server schreibt ausschließlich JSON-Zeilen nach stdout, Logs gehen
  * nach stderr – so, wie es der MCP-stdio-Transport verlangt.
@@ -16,6 +17,8 @@
 const BASE = (process.env.LT_BASE_URL ?? 'http://localhost:8081').replace(/\/+$/, '');
 const CHECK_URL = `${BASE}/v2/check`;
 const LANGUAGES_URL = `${BASE}/v2/languages`;
+const CHECK_TIMEOUT_MS = Number(process.env.LT_CHECK_TIMEOUT_MS) || 60_000;
+const LANGUAGES_TIMEOUT_MS = 15_000;
 
 const SERVER_INFO = { name: 'languagetool', version: '1.0.0' };
 const SUPPORTED_PROTOCOL_VERSIONS = ['2024-11-05', '2025-03-26', '2025-06-18'];
@@ -32,11 +35,30 @@ function send(msg) {
   process.stdout.write(JSON.stringify(msg) + '\n');
 }
 
+// Kombiniert ein optionales externes Cancel-Signal mit einem Timeout.
+// (AbortSignal.any() wäre eleganter, braucht aber Node ≥ 20.3;
+// so geht es ab Node ≥ 18.)
+function withTimeout(external, ms) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), ms);
+  const onExternal = () => controller.abort();
+  external?.addEventListener('abort', onExternal, { once: true });
+  controller.signal.addEventListener(
+    'abort',
+    () => {
+      clearTimeout(timer);
+      external?.removeEventListener('abort', onExternal);
+    },
+    { once: true }
+  );
+  return controller.signal;
+}
+
 // ---------------------------------------------------------------------------
 // LanguageTool-Client
 // ---------------------------------------------------------------------------
 
-async function ltCheck({ text, language, picky, disabledRules, enabledRules }) {
+async function ltCheck({ text, language, picky, disabledRules, enabledRules }, signal) {
   const params = new URLSearchParams();
   params.set('text', text);
   params.set('language', language || 'auto');
@@ -50,9 +72,17 @@ async function ltCheck({ text, language, picky, disabledRules, enabledRules }) {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: params.toString(),
-      signal: AbortSignal.timeout(60_000),
+      signal: withTimeout(signal, CHECK_TIMEOUT_MS),
     });
   } catch (err) {
+    if (signal?.aborted) {
+      const cancelled = new Error('Textprüfung wurde abgebrochen.');
+      cancelled.name = 'CancelledError';
+      throw cancelled;
+    }
+    if (err?.name === 'AbortError') {
+      throw new Error(`Zeitüberschreitung: LanguageTool antwortet nicht innerhalb von ${CHECK_TIMEOUT_MS / 1000} s.`);
+    }
     throw new Error(
       `LanguageTool lokal nicht erreichbar unter ${CHECK_URL} (${err.message}). ` +
         `Ist der LT-Server gestartet? (MacPorts: "sudo port load LanguageTool")`
@@ -65,11 +95,19 @@ async function ltCheck({ text, language, picky, disabledRules, enabledRules }) {
   return res.json();
 }
 
-async function ltLanguages() {
+async function ltLanguages(signal) {
   let res;
   try {
-    res = await fetch(LANGUAGES_URL, { signal: AbortSignal.timeout(15_000) });
+    res = await fetch(LANGUAGES_URL, { signal: withTimeout(signal, LANGUAGES_TIMEOUT_MS) });
   } catch (err) {
+    if (signal?.aborted) {
+      const cancelled = new Error('Sprachliste-Aufruf wurde abgebrochen.');
+      cancelled.name = 'CancelledError';
+      throw cancelled;
+    }
+    if (err?.name === 'AbortError') {
+      throw new Error(`Zeitüberschreitung: LanguageTool antwortet nicht innerhalb von ${LANGUAGES_TIMEOUT_MS / 1000} s.`);
+    }
     throw new Error(`LanguageTool lokal nicht erreichbar unter ${LANGUAGES_URL} (${err.message}).`);
   }
   if (!res.ok) throw new Error(`LanguageTool HTTP ${res.status}`);
@@ -90,6 +128,14 @@ const CATEGORY_LABELS = {
   TYPOGRAPHY: 'Typografie',
   STYLE: 'Stil',
   CASING: 'Groß-/Kleinschreibung',
+};
+
+// Feste Kategorienreihenfolge im Report (statt Reihenfolge des ersten Fundes)
+const CATEGORY_ORDER = ['Rechtschreibung', 'Grammatik', 'Zeichensetzung', 'Typografie', 'Groß-/Kleinschreibung', 'Stil'];
+
+const categoryOrderOf = (cat) => {
+  const i = CATEGORY_ORDER.indexOf(cat);
+  return i === -1 ? Number.MAX_SAFE_INTEGER : i;
 };
 
 function categoryOf(match) {
@@ -129,12 +175,11 @@ function buildCheckReport(data) {
     if (!groups.has(cat)) groups.set(cat, []);
     groups.get(cat).push(m);
   }
+  const orderedGroups = [...groups.entries()].sort(([a], [b]) => categoryOrderOf(a) - categoryOrderOf(b));
   lines.push('');
-  lines.push(
-    'Übersicht: ' + [...groups.entries()].map(([cat, items]) => `${items.length}× ${cat}`).join(', ')
-  );
+  lines.push('Übersicht: ' + orderedGroups.map(([cat, items]) => `${items.length}× ${cat}`).join(', '));
 
-  for (const [cat, items] of groups) {
+  for (const [cat, items] of orderedGroups) {
     lines.push('');
     lines.push(`### ${cat}`);
     for (const m of items) {
@@ -180,7 +225,8 @@ const TOOL_DEFS = [
           description:
             'Sprachcode, z. B. "de-DE", "en-US", oder "auto" für automatische Erkennung (Standard: auto). ' +
             'Achtung: In dieser LT-Version arbeitet die Rechtschreibprüfung für Deutsch/Englisch nur mit ' +
-            'regionalen Varianten – nackte Codes "de" bzw. "en" werden automatisch zu "de-DE" bzw. "en-US" umgebildet.',
+            'regionalen Varianten – nackte Codes "de" bzw. "en" werden automatisch zu "de-DE" bzw. "en-US" umgebildet. ' +
+            'Gemischte Schreibweise (z. B. "De") wird normalisiert.',
         },
         picky: {
           type: 'boolean',
@@ -216,35 +262,52 @@ const TOOL_DEFS = [
 // deshalb automatisch auf die gebräuchlichste Variante abbilden.
 const VARIANT_FALLBACK = { de: 'de-DE', en: 'en-US' };
 
-async function handleCheckText(args) {
+// LT erwartet kleingeschriebenen Sprach- und großgeschriebenen Regional-Subtag
+// (z. B. "de-DE"). Ohne Normalisierung würde eine gemischte Schreibweise wie
+// "De" stillschweigend mit dem nackten Basiscode laufen, wo in LT 6.x die
+// Rechtschreibwörterbücher nicht greifen.
+function normalizeLanguage(code) {
+  if (typeof code !== 'string') return code;
+  const parts = code.trim().toLowerCase().split('-').filter((p) => p.length > 0);
+  if (parts.length === 0) return 'auto';
+  const [lang, ...rest] = parts;
+  const subtags = rest.map((p) =>
+    p.length === 2 ? p.toUpperCase() : p.length === 4 ? p.charAt(0).toUpperCase() + p.slice(1) : p
+  );
+  return [lang, ...subtags].join('-');
+}
+
+async function handleCheckText(args, signal) {
   const { text, language = 'auto', picky = false, disabledRules = [], enabledRules = [] } = args ?? {};
   if (typeof text !== 'string' || text.trim().length === 0) {
     throw new Error('Argument "text" fehlt oder ist leer.');
   }
-  const effectiveLanguage = VARIANT_FALLBACK[language] ?? language;
-  const data = await ltCheck({ text, language: effectiveLanguage, picky, disabledRules, enabledRules });
+  const normalized = normalizeLanguage(language);
+  const effectiveLanguage = VARIANT_FALLBACK[normalized] ?? normalized;
+  const data = await ltCheck({ text, language: effectiveLanguage, picky, disabledRules, enabledRules }, signal);
   return ok(buildCheckReport(data));
 }
 
-async function handleListLanguages() {
-  const rows = await ltLanguages();
+async function handleListLanguages(signal) {
+  const rows = await ltLanguages(signal);
   const lines = rows.map((l) => `${l.longCode ?? l.code} — ${l.name}`);
   return ok(`${rows.length} Sprachen:\n${lines.join('\n')}`);
 }
 
-async function callTool(params) {
+async function callTool(params, signal) {
   const name = params?.name;
   const args = params?.arguments ?? {};
   try {
     switch (name) {
       case 'check_text':
-        return await handleCheckText(args);
+        return await handleCheckText(args, signal);
       case 'list_languages':
-        return await handleListLanguages();
+        return await handleListLanguages(signal);
       default:
         return errorResult(`Unbekanntes Tool: ${name}`);
     }
   } catch (err) {
+    if (err?.name === 'CancelledError') return errorResult(err.message);
     return errorResult(`Aufruf fehlgeschlagen: ${err?.message ?? String(err)}`);
   }
 }
@@ -261,7 +324,7 @@ function makeError(id, code, message) {
   return { jsonrpc: '2.0', id, error: { code, message } };
 }
 
-async function handleMessage(msg) {
+async function handleMessage(msg, signal) {
   const { id, method, params } = msg ?? {};
   const isNotification = id === undefined;
 
@@ -281,7 +344,17 @@ async function handleMessage(msg) {
     case 'tools/list':
       return makeResult(id, { tools: TOOL_DEFS });
     case 'tools/call':
-      return makeResult(id, await callTool(params));
+      return makeResult(id, await callTool(params, signal));
+    case 'notifications/cancelled': {
+      const targetId = params?.requestId;
+      const target = inFlight.get(targetId);
+      if (target) {
+        inFlight.delete(targetId);
+        target.abort();
+        log(`↯ Request ${targetId} vom Client abgebrochen`);
+      }
+      return undefined;
+    }
     default:
       // Benachrichtigungen (z. B. notifications/initialized) brauchen keine Antwort.
       if (isNotification) return undefined;
@@ -290,6 +363,7 @@ async function handleMessage(msg) {
 }
 
 const pending = new Set();
+const inFlight = new Map(); // Request-ID -> AbortController (für notifications/cancelled)
 
 let buffer = '';
 process.stdin.setEncoding('utf8');
@@ -308,9 +382,14 @@ process.stdin.on('data', (chunk) => {
       send(makeError(null, -32700, 'Parse error'));
       continue;
     }
-    if (msg.id !== undefined) log(`← ${msg.method}`);
+    if (msg.id !== undefined) log(`← ${msg.id} ${msg.method}`);
 
-    const job = handleMessage(msg)
+    // Jede Request bekommt einen eigenen AbortController – so können Clients
+    // laufende Requests abbrechen (MCP: notifications/cancelled).
+    const controller = msg.id !== undefined ? new AbortController() : undefined;
+    if (controller) inFlight.set(msg.id, controller);
+
+    const job = handleMessage(msg, controller?.signal)
       .then((reply) => {
         if (reply !== undefined) send(reply);
       })
@@ -318,6 +397,9 @@ process.stdin.on('data', (chunk) => {
         if (msg.id !== undefined) {
           send(makeError(msg.id, -32603, `Interner Fehler: ${err?.message ?? String(err)}`));
         }
+      })
+      .finally(() => {
+        if (controller) inFlight.delete(msg.id);
       });
     pending.add(job);
     job.finally(() => pending.delete(job));

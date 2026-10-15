@@ -24,6 +24,11 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 const SERVER = path.join(HERE, '..', 'server.mjs');
 const BASE = (process.env.LT_BASE_URL ?? 'http://localhost:8081').replace(/\/+$/, '');
 
+// Client-Timeout: muss größer sein als der LT-Timeout des Servers
+// (LT_CHECK_TIMEOUT_MS, Standard 60 s), sonst erzeugen langsame Checks
+// verwirrende Timeouts. Überschreiben: MCP_TEST_TIMEOUT_MS.
+const REQUEST_TIMEOUT_MS = Number(process.env.MCP_TEST_TIMEOUT_MS) || 90_000;
+
 // Einmalig prüfen, ob die LanguageTool-Instanz erreichbar ist. Ist sie nicht da,
 // werden die Tests übersprungen (der skip-Grund ist eine Zeichenkette).
 const ltUp = await fetch(`${BASE}/v2/languages`, { signal: AbortSignal.timeout(5000) })
@@ -46,7 +51,9 @@ class McpClient {
     });
     this.buf = '';
     this.nextId = 0;
+    this.lastRequestId = 0;
     this.waiters = new Map(); // id -> { resolve, reject }
+    this.orphanResponses = []; // Antworten ohne wartenden Request (z. B. Parse-Error mit id null)
     this.child.stdout.on('data', (d) => this.onData(d.toString()));
     this.child.stderr.on('data', () => {}); // Server-Logs bewusst ignorieren
     this.child.on('error', (err) => {
@@ -68,18 +75,21 @@ class McpClient {
       if (waiter) {
         this.waiters.delete(msg.id);
         waiter.resolve(msg);
+      } else {
+        this.orphanResponses.push(msg);
       }
     }
   }
 
   request(method, params) {
     const id = ++this.nextId;
+    this.lastRequestId = id;
     this.child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n');
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.waiters.delete(id);
         reject(new Error(`Timeout: keine Antwort auf "${method}"`));
-      }, 15000);
+      }, REQUEST_TIMEOUT_MS);
       this.waiters.set(id, {
         resolve: (msg) => { clearTimeout(timer); resolve(msg); },
         reject: (err) => { clearTimeout(timer); reject(err); },
@@ -105,6 +115,15 @@ async function check(client, args) {
   assert.equal(res.error, undefined, `JSON-RPC-Fehler: ${JSON.stringify(res.error)}`);
   const text = res.result?.content?.[0]?.text ?? '';
   return { result: res.result, text };
+}
+
+// Bedingung in kurzen Abständen pollen, bis sie erfüllt ist (sonst Timeout)
+async function waitFor(cond, timeoutMs, label) {
+  const start = Date.now();
+  while (!cond()) {
+    if (Date.now() - start > timeoutMs) throw new Error(`Timeout: ${label} nicht rechtzeitig erfüllt`);
+    await new Promise((r) => setTimeout(r, 50));
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -156,6 +175,34 @@ test('leerer Text wird abgelehnt', SKIP, async () => {
   });
 });
 
+test('unbekannte Methode liefert JSON-RPC-Fehler -32601', async () => {
+  await withClient(async (c) => {
+    const res = await c.request('kann/nicht/existieren', {});
+    assert.equal(res.result, undefined);
+    assert.equal(res.error.code, -32601);
+  });
+});
+
+test('ungültiges JSON liefert JSON-RPC-Fehler -32700', async () => {
+  await withClient(async (c) => {
+    c.child.stdin.write('das ist kein JSON\n');
+    await waitFor(
+      () => c.orphanResponses.some((m) => m.error?.code === -32700),
+      5000,
+      'Parse-Error-Antwort'
+    );
+  });
+});
+
+test('Benachrichtigung (notifications/initialized) erzeugt keine Antwort', async () => {
+  await withClient(async (c) => {
+    const before = c.orphanResponses.length;
+    c.child.stdin.write(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }) + '\n');
+    await new Promise((r) => setTimeout(r, 300));
+    assert.equal(c.orphanResponses.length, before, 'Server hat auf eine Benachrichtigung geantwortet');
+  });
+});
+
 // ---------------------------------------------------------------------------
 // Fehlerbehandlung – läuft immer, auch ohne erreichbare LT-Instanz
 // ---------------------------------------------------------------------------
@@ -177,6 +224,30 @@ test('un erreichbare LT-Instanz: saubere Tool-Fehler statt JSON-RPC-Fehler', asy
     const listText = listRes.result.content[0].text;
     assert.match(listText, /nicht erreichbar/);
     assert.doesNotMatch(listText, /Textprüfung/); // Fehlerschluss darf nicht tool-spezifisch irreführen
+  } finally {
+    client.kill();
+  }
+});
+
+test('Client-Cancellation bricht laufende Prüfung ab (notifications/cancelled)', async () => {
+  // Blackhole-Adresse: die Anfrage hängt, bis der Client sie abbricht.
+  const client = new McpClient({ LT_BASE_URL: 'http://10.255.255.1:8081' });
+  try {
+    const pending = client.request('tools/call', {
+      name: 'check_text',
+      arguments: { text: 'Hallo Welt.', language: 'de-DE' },
+    });
+    client.child.stdin.write(
+      JSON.stringify({
+        jsonrpc: '2.0',
+        method: 'notifications/cancelled',
+        params: { requestId: client.lastRequestId },
+      }) + '\n'
+    );
+    const res = await pending;
+    assert.equal(res.error, undefined);
+    assert.equal(res.result.isError, true);
+    assert.match(res.result.content[0].text, /abgebrochen/);
   } finally {
     client.kill();
   }
@@ -247,6 +318,31 @@ test('Deutsch: fehlerfreier Text liefert keine Hinweise', SKIP, async () => {
   });
 });
 
+test('Deutsch: picky findet zusätzliche Stil-Hinweise', SKIP, async () => {
+  await withClient(async (c) => {
+    const text = 'Das macht wenig Sinn, aber es ist so.';
+    const standard = await check(c, { text, language: 'de-DE' });
+    assert.equal(standard.result.isError, undefined);
+    assert.match(standard.text, /Keine Probleme gefunden/);
+
+    const picky = await check(c, { text, language: 'de-DE', picky: true });
+    assert.equal(picky.result.isError, undefined);
+    assert.match(picky.text, /SINN_MACHEN/);
+  });
+});
+
+test('Deutsch: disabledRules unterdrückt eine Regel', SKIP, async () => {
+  await withClient(async (c) => {
+    const { result, text } = await check(c, {
+      text: 'Ich habe ein Problem mit der Rechtschreibprufung.',
+      language: 'de-DE',
+      disabledRules: ['GERMAN_SPELLER_RULE'],
+    });
+    assert.equal(result.isError, undefined);
+    assert.match(text, /Keine Probleme gefunden/);
+  });
+});
+
 // ---------------------------------------------------------------------------
 // Fehlererkennung – Englisch
 // ---------------------------------------------------------------------------
@@ -307,6 +403,50 @@ test('Englisch: fehlerfreier Text liefert keine Hinweise', SKIP, async () => {
     });
     assert.equal(result.isError, undefined);
     assert.match(text, /Keine Probleme gefunden/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Sprachcode-Normalisierung
+// ---------------------------------------------------------------------------
+
+test('Deutsch: gemischte Schreibweise im Sprachcode ("De") wird normalisiert', SKIP, async () => {
+  await withClient(async (c) => {
+    const { result, text } = await check(c, {
+      text: 'Ich habe ein Problem mit der Rechtschreibprufung.',
+      language: 'De',
+    });
+    assert.equal(result.isError, undefined);
+    assert.match(text, /### Rechtschreibung/); // statt stiller "Keine Probleme gefunden"
+  });
+});
+
+test('Englisch: Großbuchstaben-Sprachcode ("EN") wird normalisiert', SKIP, async () => {
+  await withClient(async (c) => {
+    const { result, text } = await check(c, {
+      text: 'This is a spellig error.',
+      language: 'EN',
+    });
+    assert.equal(result.isError, undefined);
+    assert.match(text, /### Rechtschreibung/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Berichtsformat
+// ---------------------------------------------------------------------------
+
+test('Kategorien erscheinen in fester Prioritätsreihenfolge', SKIP, async () => {
+  await withClient(async (c) => {
+    const { text } = await check(c, {
+      text: 'Er haben ein Problem mit der Rechtschreibprufung.',
+      language: 'de-DE',
+    });
+    const spelling = text.indexOf('### Rechtschreibung');
+    const grammar = text.indexOf('### Grammatik');
+    assert.notEqual(spelling, -1, 'Rechtschreibung fehlt im Report');
+    assert.notEqual(grammar, -1, 'Grammatik fehlt im Report');
+    assert.ok(spelling < grammar, 'Rechtschreibung sollte vor Grammatik erscheinen');
   });
 });
 
