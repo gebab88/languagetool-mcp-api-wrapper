@@ -56,7 +56,7 @@ Die Tests starten den Server als Prozess und sprechen das MCP-Protokoll mit ihm 
 Voraussetzung: Node.js ≥ 18 und eine erreichbare LanguageTool-Instanz (`LT_BASE_URL`, Standard `http://localhost:8081`). Ohne erreichbare Instanz werden die Tests übersprungen (skip), statt zu scheitern.
 
 ```bash
-node --test
+node --test   # oder: npm test
 ```
 
 ## Lizenz

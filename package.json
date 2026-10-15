@@ -1,0 +1,14 @@
+{
+  "name": "languagetool-mcp-api-wrapper",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Lokaler MCP-Server (stdio, JSON-RPC 2.0) für eine selbst gehostete LanguageTool-Instanz – reines Node.js, ohne externe Abhängigkeiten",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node --test"
+  }
+}

@@ -80,15 +80,23 @@ async function ltLanguages() {
 // Ausgabeformatierung
 // ---------------------------------------------------------------------------
 
+// LanguageTool liefert die Kategorie-Zuschrift je nach geprüfter Sprache
+// lokalisiert ("Mögliche Tippfehler" vs. "Possible Typo") – die Kategorie-IDs
+// sind dagegen stabil, deshalb danach mappen.
+const CATEGORY_LABELS = {
+  TYPOS: 'Rechtschreibung',
+  GRAMMAR: 'Grammatik',
+  PUNCTUATION: 'Zeichensetzung',
+  TYPOGRAPHY: 'Typografie',
+  STYLE: 'Stil',
+  CASING: 'Groß-/Kleinschreibung',
+};
+
 function categoryOf(match) {
-  const raw = match.rule?.category?.name ?? match.rule?.issueType ?? '';
-  const n = String(raw).toLowerCase();
-  if (n.includes('spelling')) return 'Rechtschreibung';
-  if (n.includes('grammar')) return 'Grammatik';
-  if (n.includes('punctuation')) return 'Zeichensetzung';
-  if (n.includes('typography')) return 'Typografie';
-  if (n.includes('style')) return 'Stil';
-  return raw ? String(raw) : 'Sonstiges';
+  const category = match.rule?.category ?? {};
+  const label = CATEGORY_LABELS[String(category.id ?? '').toUpperCase()];
+  if (label) return label;
+  return category.name ?? (match.rule?.issueType ? String(match.rule.issueType) : 'Sonstiges');
 }
 
 function ok(text) {
@@ -99,7 +107,7 @@ function errorResult(text) {
   return { content: [{ type: 'text', text }], isError: true };
 }
 
-function buildCheckReport(data, inputText) {
+function buildCheckReport(data) {
   const matches = Array.isArray(data.matches) ? data.matches : [];
   const lang = data.language ?? {};
   const detected = lang.detectedLanguage ?? lang;
@@ -110,7 +118,7 @@ function buildCheckReport(data, inputText) {
   );
   lines.push(`Sprache: ${detected.name ?? lang.name ?? '?'} (${detected.code ?? lang.code ?? '?'})`);
   if (data.warnings?.incompleteResults) {
-    lines.push('(Hinweis: LanguageTool hat die Ergebnisse gekürzt – Text für den öffentlichen Dienst zu groß?)');
+    lines.push('(Hinweis: LanguageTool hat die Ergebnisse gekürzt – der Text ist sehr lang)');
   }
   if (matches.length === 0) return lines.join('\n');
 
@@ -148,7 +156,6 @@ function buildCheckReport(data, inputText) {
     }
   }
 
-  void inputText;
   return lines.join('\n');
 }
 
@@ -216,7 +223,7 @@ async function handleCheckText(args) {
   }
   const effectiveLanguage = VARIANT_FALLBACK[language] ?? language;
   const data = await ltCheck({ text, language: effectiveLanguage, picky, disabledRules, enabledRules });
-  return ok(buildCheckReport(data, text));
+  return ok(buildCheckReport(data));
 }
 
 async function handleListLanguages() {
@@ -238,7 +245,7 @@ async function callTool(params) {
         return errorResult(`Unbekanntes Tool: ${name}`);
     }
   } catch (err) {
-    return errorResult(`Textprüfung fehlgeschlagen: ${err?.message ?? String(err)}`);
+    return errorResult(`Aufruf fehlgeschlagen: ${err?.message ?? String(err)}`);
   }
 }
 

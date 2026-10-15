@@ -11,7 +11,7 @@
  * (LT_BASE_URL, Standard: http://localhost:8081). Ist sie nicht erreichbar,
  * werden die Tests übersprungen (skip) und schlagen nicht fehl.
  *
- * Ausführen:  node --test test/
+ * Ausführen:  node --test   (oder: npm test)
  */
 
 import { test } from 'node:test';
@@ -39,8 +39,11 @@ const SKIP = ltUp ? false : `LanguageTool-Instanz nicht erreichbar unter ${BASE}
 // ---------------------------------------------------------------------------
 
 class McpClient {
-  constructor() {
-    this.child = spawn(process.execPath, [SERVER], { stdio: ['pipe', 'pipe', 'pipe'] });
+  constructor(env = {}) {
+    this.child = spawn(process.execPath, [SERVER], {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      env: { ...process.env, ...env },
+    });
     this.buf = '';
     this.nextId = 0;
     this.waiters = new Map(); // id -> { resolve, reject }
@@ -154,6 +157,32 @@ test('leerer Text wird abgelehnt', SKIP, async () => {
 });
 
 // ---------------------------------------------------------------------------
+// Fehlerbehandlung – läuft immer, auch ohne erreichbare LT-Instanz
+// ---------------------------------------------------------------------------
+
+test('un erreichbare LT-Instanz: saubere Tool-Fehler statt JSON-RPC-Fehler', async () => {
+  const client = new McpClient({ LT_BASE_URL: 'http://127.0.0.1:9' });
+  try {
+    const checkRes = await client.request('tools/call', {
+      name: 'check_text',
+      arguments: { text: 'Hallo Welt.', language: 'de-DE' },
+    });
+    assert.equal(checkRes.error, undefined);
+    assert.equal(checkRes.result.isError, true);
+    assert.match(checkRes.result.content[0].text, /nicht erreichbar/);
+
+    const listRes = await client.request('tools/call', { name: 'list_languages', arguments: {} });
+    assert.equal(listRes.error, undefined);
+    assert.equal(listRes.result.isError, true);
+    const listText = listRes.result.content[0].text;
+    assert.match(listText, /nicht erreichbar/);
+    assert.doesNotMatch(listText, /Textprüfung/); // Fehlerschluss darf nicht tool-spezifisch irreführen
+  } finally {
+    client.kill();
+  }
+});
+
+// ---------------------------------------------------------------------------
 // Fehlererkennung – Deutsch
 // ---------------------------------------------------------------------------
 
@@ -165,7 +194,7 @@ test('Deutsch: Rechtschreibfehler wird erkannt', SKIP, async () => {
     });
     assert.equal(result.isError, undefined);
     assert.match(text, /Rechtschreibprufung/);           // das Fehlwort selbst
-    assert.match(text, /Mögliche Tippfehler/);           // Kategorie
+    assert.match(text, /### Rechtschreibung/);          // Kategorie (per stabiler category.id, sprachunabhängig)
     assert.match(text, /GERMAN_SPELLER_RULE/);          // die Regel
     assert.match(text, /German \(Germany\) \(de-DE\)/); // erkannte Sprache
   });
@@ -192,6 +221,7 @@ test('Deutsch: Satzanfang ohne Großbuchstabe wird erkannt', SKIP, async () => {
     });
     assert.equal(result.isError, undefined);
     assert.match(text, /`das`/);
+    assert.match(text, /Groß-\/Kleinschreibung/); // Kategorie (CASING)
   });
 });
 
@@ -229,7 +259,7 @@ test('Englisch: Rechtschreibfehler wird erkannt', SKIP, async () => {
     });
     assert.equal(result.isError, undefined);
     assert.match(text, /spellig/);
-    assert.match(text, /Possible Typo/);
+    assert.match(text, /### Rechtschreibung/);          // Kategorie (per stabiler category.id, sprachunabhängig)
     assert.match(text, /English \(US\) \(en-US\)/);
   });
 });
@@ -254,6 +284,7 @@ test('Englisch: Satzanfang ohne Großbuchstabe wird erkannt', SKIP, async () => 
     });
     assert.equal(result.isError, undefined);
     assert.match(text, /`this`/);
+    assert.match(text, /Groß-\/Kleinschreibung/); // Kategorie (CASING)
   });
 });
 
